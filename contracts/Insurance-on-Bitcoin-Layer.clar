@@ -7,6 +7,8 @@
 (define-constant ERR_INVALID_THRESHOLD (err u106))
 (define-constant ERR_POLICY_ACTIVE (err u107))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u108))
+(define-constant ERR_POLICY_NOT_ELIGIBLE_FOR_RENEWAL (err u109))
+(define-constant ERR_CANNOT_RENEW_CLAIMED_POLICY (err u110))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var policy-counter uint u0)
@@ -44,6 +46,15 @@
     amount: uint,
     paid-block: uint,
     trigger-value: uint
+  }
+)
+
+(define-map renewal-history 
+  principal 
+  {
+    total-renewals: uint,
+    last-renewal-block: uint,
+    policies-without-claims: uint
   }
 )
 
@@ -188,6 +199,71 @@
   )
 )
 
+(define-public (renew-policy (old-policy-id uint) (new-duration uint))
+  (let 
+    (
+      (old-policy (unwrap! (map-get? policies old-policy-id) ERR_POLICY_NOT_FOUND))
+      (policy-holder (get policy-holder old-policy))
+      (renewal-record (default-to 
+        { total-renewals: u0, last-renewal-block: u0, policies-without-claims: u0 }
+        (map-get? renewal-history policy-holder)
+      ))
+      (discount-rate (calculate-renewal-discount (get total-renewals renewal-record) (get claimed old-policy)))
+      (base-premium (/ (* (get coverage-amount old-policy) u10) u100))
+      (discounted-premium (- base-premium (/ (* base-premium discount-rate) u100)))
+      (new-policy-id (+ (var-get policy-counter) u1))
+      (new-expiry-block (+ stacks-block-height new-duration))
+    )
+    (asserts! (is-eq tx-sender policy-holder) ERR_NOT_AUTHORIZED)
+    (asserts! (>= stacks-block-height (get expiry-block old-policy)) ERR_POLICY_NOT_ELIGIBLE_FOR_RENEWAL)
+    (asserts! (>= discounted-premium (var-get min-premium)) ERR_INSUFFICIENT_PREMIUM)
+    
+    (try! (stx-transfer? discounted-premium tx-sender (as-contract tx-sender)))
+    
+    (map-set policies new-policy-id {
+      policy-holder: policy-holder,
+      premium: discounted-premium,
+      coverage-amount: (get coverage-amount old-policy),
+      trigger-condition: (get trigger-condition old-policy),
+      expiry-block: new-expiry-block,
+      claimed: false,
+      policy-type: (get policy-type old-policy),
+      created-block: stacks-block-height
+    })
+    
+    (map-set renewal-history policy-holder {
+      total-renewals: (+ (get total-renewals renewal-record) u1),
+      last-renewal-block: stacks-block-height,
+      policies-without-claims: (if (get claimed old-policy) 
+        (get policies-without-claims renewal-record)
+        (+ (get policies-without-claims renewal-record) u1)
+      )
+    })
+    
+    (var-set policy-counter new-policy-id)
+    (ok { new-policy-id: new-policy-id, discount-applied: discount-rate, premium-paid: discounted-premium })
+  )
+)
+
+(define-private (calculate-renewal-discount (renewal-count uint) (was-claimed bool))
+  (let 
+    (
+      (base-discount (if (<= renewal-count u0) u0
+        (if (<= renewal-count u2) u5
+          (if (<= renewal-count u5) u10
+            (if (<= renewal-count u10) u15 u20)
+          )
+        )
+      ))
+      (claim-penalty (if was-claimed u5 u0))
+    )
+    (if (>= base-discount claim-penalty)
+      (- base-discount claim-penalty)
+      u0
+    )
+  )
+)
+
 (define-read-only (get-policy (policy-id uint))
   (map-get? policies policy-id)
 )
@@ -257,5 +333,41 @@
         )
       )
     "not-found"
+  )
+)
+
+(define-read-only (get-renewal-history (holder principal))
+  (map-get? renewal-history holder)
+)
+
+(define-read-only (get-renewal-discount (holder principal))
+  (let 
+    (
+      (renewal-record (map-get? renewal-history holder))
+    )
+    (match renewal-record
+      record (calculate-renewal-discount (get total-renewals record) false)
+      u0
+    )
+  )
+)
+
+(define-read-only (estimate-renewal-premium (policy-id uint))
+  (match (map-get? policies policy-id)
+    policy 
+      (let 
+        (
+          (policy-holder (get policy-holder policy))
+          (renewal-record (default-to 
+            { total-renewals: u0, last-renewal-block: u0, policies-without-claims: u0 }
+            (map-get? renewal-history policy-holder)
+          ))
+          (discount-rate (calculate-renewal-discount (get total-renewals renewal-record) (get claimed policy)))
+          (base-premium (/ (* (get coverage-amount policy) u10) u100))
+          (discounted-premium (- base-premium (/ (* base-premium discount-rate) u100)))
+        )
+        (some { base-premium: base-premium, discount-rate: discount-rate, final-premium: discounted-premium })
+      )
+    none
   )
 )
